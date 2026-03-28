@@ -3,96 +3,83 @@ namespace NourSwarm;
 public sealed class TradingAgent
 {
     public Guid Id { get; }
+    public AgentRole Role { get; }
+    public Side Side { get; }
+    public decimal PriceLevel { get; }
+    public decimal InitialVolume { get; }
+    public decimal RemainingVolume { get; private set; }
     public AgentDna OCEANTraits { get; }
+    public decimal CancellationRate { get; }
+    public bool IsCancelled { get; private set; }
+    public bool IsTopOfBook { get; }
 
-    public TradingAgent(Guid id, AgentDna traits)
+    public TradingAgent(
+        Guid id,
+        AgentRole role,
+        Side side,
+        decimal priceLevel,
+        decimal volume,
+        AgentDna traits,
+        decimal cancellationRate,
+        bool isTopOfBook)
     {
         Id = id;
+        Role = role;
+        Side = side;
+        PriceLevel = priceLevel;
+        InitialVolume = volume;
+        RemainingVolume = volume;
         OCEANTraits = traits;
+        CancellationRate = cancellationRate;
+        IsTopOfBook = isTopOfBook;
     }
 
-    public AgentAction? Act(OrderBookSnapshot lob, ReadOnlySpan<decimal> closeHistory, decimal recentChange, Random random)
+    public bool IsActive => !IsCancelled && RemainingVolume > 0m;
+
+    public decimal Consume(decimal quantity)
     {
-        var activity = 0.10 + (OCEANTraits.Extraversion / 200.0);
-        if (random.NextDouble() > activity)
+        if (IsCancelled || quantity <= 0m || RemainingVolume <= 0m)
         {
-            return null;
+            return 0m;
         }
 
-        var panicThreshold = 0.001m + (decimal)((100.0 - OCEANTraits.Neuroticism) / 100.0) * 0.02m;
-        if (recentChange < -panicThreshold)
-        {
-            var qty = 0.5m + (decimal)(OCEANTraits.Neuroticism / 100.0) * 1.5m;
-            return new AgentAction(true, new Order(Id, Side.Sell, 0m, qty, OrderType.Market));
-        }
-
-        var marketProbability = OCEANTraits.Extraversion / 100.0;
-        var isMarket = random.NextDouble() < marketProbability;
-
-        var side = ChooseSide(closeHistory, lob, random);
-        var quantity = 0.5m + (decimal)((OCEANTraits.Extraversion + OCEANTraits.Openness) / 200.0);
-        var price = isMarket ? 0m : ComputeLimitPrice(side, lob, random);
-
-        return new AgentAction(false, new Order(Id, side, price, quantity, isMarket ? OrderType.Market : OrderType.Limit));
+        var filled = Math.Min(quantity, RemainingVolume);
+        RemainingVolume -= filled;
+        return filled;
     }
 
-    private Side ChooseSide(ReadOnlySpan<decimal> closeHistory, OrderBookSnapshot lob, Random random)
+    public bool TryCancelByNeuroticTrigger(decimal simulatedPrice, decimal tickSize, int triggerTicks)
     {
-        var momentumBias = 0;
-
-        if (OCEANTraits.Agreeableness >= 60 && closeHistory.Length >= 4)
+        if (Role != AgentRole.Passive || IsCancelled || OCEANTraits.Neuroticism < 70.0)
         {
-            var i = closeHistory.Length - 1;
-            //increasing price.
-            var g1 = closeHistory[i] > closeHistory[i - 1];
-            var g2 = closeHistory[i - 1] > closeHistory[i - 2];
-            var g3 = closeHistory[i - 2] > closeHistory[i - 3];
-            if (g1 && g2 && g3)
-            {
-                momentumBias = 1;
-            }
-            else if (!g1 && !g2 && !g3)
-            {
-                momentumBias = -1;
-            }
+            return false;
         }
 
-        if (momentumBias > 0)
+        var triggerDistance = tickSize * triggerTicks;
+        if (Math.Abs(PriceLevel - simulatedPrice) > triggerDistance)
         {
-            return Side.Buy;
+            return false;
         }
 
-        if (momentumBias < 0)
-        {
-            return Side.Sell;
-        }
-
-        var imbalanceBias = lob.Imbalance >= 0m ? Side.Buy : Side.Sell;
-        return random.NextDouble() < 0.55 ? imbalanceBias : (imbalanceBias == Side.Buy ? Side.Sell : Side.Buy);
+        IsCancelled = true;
+        RemainingVolume = 0m;
+        return true;
     }
 
-    private decimal ComputeLimitPrice(Side side, OrderBookSnapshot lob, Random random)
+    public static TradingAgent CreatePassive(
+        Guid id,
+        Side side,
+        decimal priceLevel,
+        decimal volume,
+        AgentDna traits,
+        decimal cancellationRate,
+        bool isTopOfBook)
     {
-        var price = lob.MidPrice;
-        var spread = lob.Spread == 0m ? 0.01m : lob.Spread;
+        return new TradingAgent(id, AgentRole.Passive, side, priceLevel, volume, traits, cancellationRate, isTopOfBook);
+    }
 
-        if (OCEANTraits.Conscientiousness >= 65)
-        {
-            price = lob.Vwap;
-        }
-        else if (OCEANTraits.Openness >= 65)
-        {
-            var multiplier = 1m + (decimal)(OCEANTraits.Openness / 100.0) * 0.5m;
-            price = side == Side.Buy
-                ? lob.BestBid - spread * multiplier
-                : lob.BestAsk + spread * multiplier;
-        }
-        else
-        {
-            var jitter = (decimal)(random.NextDouble() - 0.5) * spread;
-            price = side == Side.Buy ? lob.BestBid + jitter : lob.BestAsk + jitter;
-        }
-
-        return Math.Max(0.0001m, decimal.Round(price, 4));
+    public static TradingAgent CreateAggressive(Guid id, Side side, decimal priceLevel, decimal quantity, AgentDna traits)
+    {
+        return new TradingAgent(id, AgentRole.Aggressive, side, priceLevel, quantity, traits, 0m, isTopOfBook: false);
     }
 }

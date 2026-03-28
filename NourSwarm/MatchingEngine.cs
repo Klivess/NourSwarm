@@ -1,268 +1,143 @@
-using System.Collections.Concurrent;
-
 namespace NourSwarm;
 
 public sealed class MatchingEngine
 {
-    private sealed class LimitOrderEntry
-    {
-        public required Order Order { get; init; }
-        public decimal RemainingQuantity { get; set; }
-        public bool IsCancelled { get; set; }
-    }
-
-    private readonly ConcurrentQueue<Order> _incoming = new();
-    private readonly SortedDictionary<decimal, Queue<LimitOrderEntry>> _bids = new(Comparer<decimal>.Create((x, y) => y.CompareTo(x)));
-    private readonly SortedDictionary<decimal, Queue<LimitOrderEntry>> _asks = [];
-    private readonly Dictionary<Guid, List<LimitOrderEntry>> _ordersByAgent = [];
-    private readonly Queue<(decimal Price, decimal Quantity)> _recentTrades = new();
-
-    private const int MaxTradeWindow = 256;
+    private readonly SortedDictionary<decimal, TradingAgent> _bids;
+    private readonly SortedDictionary<decimal, TradingAgent> _asks;
+    private readonly decimal _tickSize;
 
     public decimal SimulatedPrice { get; private set; }
 
-    public MatchingEngine(decimal initialPrice)
+    public MatchingEngine(IEnumerable<TradingAgent> passiveAgents, decimal initialPrice, decimal tickSize)
     {
+        _tickSize = Math.Max(0.00000001m, tickSize);
         SimulatedPrice = initialPrice;
-    }
 
-    public void Process(Order order) => _incoming.Enqueue(order);
+        _bids = new SortedDictionary<decimal, TradingAgent>(Comparer<decimal>.Create((x, y) => y.CompareTo(x)));
+        _asks = new SortedDictionary<decimal, TradingAgent>();
 
-    public void CancelAgentOrders(Guid agentId)
-    {
-        if (_ordersByAgent.TryGetValue(agentId, out var entries))
+        foreach (var agent in passiveAgents)
         {
-            foreach (var entry in entries)
-            {
-                entry.IsCancelled = true;
-                entry.RemainingQuantity = 0m;
-            }
-
-            entries.Clear();
-        }
-    }
-
-    public ExecutionBatch DrainIncomingAndMatch()
-    {
-        var aggressiveBuys = 0;
-        var aggressiveSells = 0;
-        var executedTrades = 0;
-
-        while (_incoming.TryDequeue(out var order))
-        {
-            if (order.Quantity <= 0m)
+            if (agent.Role != AgentRole.Passive || agent.InitialVolume <= 0m)
             {
                 continue;
             }
 
-            if (order.Type == OrderType.Market)
+            if (agent.Side == Side.Buy)
             {
-                var tradeCount = ExecuteMarket(order);
-                executedTrades += tradeCount;
-                if (tradeCount > 0)
-                {
-                    if (order.Side == Side.Buy) aggressiveBuys++;
-                    else aggressiveSells++;
-                }
+                _bids[agent.PriceLevel] = agent;
+            }
+            else
+            {
+                _asks[agent.PriceLevel] = agent;
+            }
+        }
+    }
 
+    public DeterministicPrediction RunDeterministic(IReadOnlyList<TradingAgent> aggressiveAgents, int neuroticPullTicks = 2)
+    {
+        var levelsConsumed = 0;
+        var cancelledLevels = 0;
+        decimal remainingAggressiveVolume = 0m;
+
+        for (int i = 0; i < aggressiveAgents.Count; i++)
+        {
+            var aggressor = aggressiveAgents[i];
+            if (aggressor.Role != AgentRole.Aggressive || aggressor.InitialVolume <= 0m)
+            {
                 continue;
             }
 
-            var remaining = order.Quantity;
-            var tradeCountForLimit = ExecuteAgainstBook(order.Side, order.AgentId, order.Price, ref remaining, isAggressor: true);
-            executedTrades += tradeCountForLimit;
+            var remaining = aggressor.InitialVolume;
+            remainingAggressiveVolume += remaining;
 
-            if (tradeCountForLimit > 0)
+            while (remaining > 0m)
             {
-                if (order.Side == Side.Buy) aggressiveBuys++;
-                else aggressiveSells++;
-            }
+                cancelledLevels += PullTriggeredNeuroticLiquidity(aggressor.Side, neuroticPullTicks);
 
-            if (remaining > 0m)
-            {
-                AddLimit(new Order(order.AgentId, order.Side, order.Price, remaining, OrderType.Limit));
-            }
-        }
-
-        return new ExecutionBatch(executedTrades, aggressiveBuys, aggressiveSells);
-    }
-
-    public OrderBookSnapshot GetSnapshot()
-    {
-        var bestBid = GetBestPrice(_bids, Side.Buy) ?? SimulatedPrice - 0.01m;
-        var bestAsk = GetBestPrice(_asks, Side.Sell) ?? SimulatedPrice + 0.01m;
-
-        if (bestAsk <= bestBid)
-        {
-            bestAsk = bestBid + 0.01m;
-        }
-
-        var spread = Math.Max(0.0001m, bestAsk - bestBid);
-        var mid = (bestBid + bestAsk) * 0.5m;
-        var vwap = CalculateTradeVwap();
-
-        var bidQty = GetTopQuantity(_bids);
-        var askQty = GetTopQuantity(_asks);
-        var imbalance = (bidQty - askQty) / (bidQty + askQty + 1m);
-
-        return new OrderBookSnapshot(bestBid, bestAsk, mid, vwap, spread, imbalance);
-    }
-
-    private int ExecuteMarket(Order order)
-    {
-        var remaining = order.Quantity;
-        return ExecuteAgainstBook(order.Side, order.AgentId, 0m, ref remaining, isAggressor: true);
-    }
-
-    private int ExecuteAgainstBook(Side side, Guid aggressorAgentId, decimal price, ref decimal remaining, bool isAggressor)
-    {
-        var tradeCount = 0;
-
-        if (side == Side.Buy)
-        {
-            while (remaining > 0m && TryGetBestOrder(_asks, out var bestAskPrice, out var entry))
-            {
-                if (price > 0m && bestAskPrice > price)
+                if (!TryGetBestPassiveLevel(aggressor.Side, out var restingAgent))
                 {
                     break;
                 }
 
-                var traded = Math.Min(remaining, entry.RemainingQuantity);
-                remaining -= traded;
-                entry.RemainingQuantity -= traded;
-                tradeCount++;
-                RegisterTrade(bestAskPrice, traded);
+                var filled = restingAgent.Consume(remaining);
+                if (filled <= 0m)
+                {
+                    RemoveIfInactive(restingAgent);
+                    continue;
+                }
+
+                remaining -= filled;
+                remainingAggressiveVolume -= filled;
+                SimulatedPrice = restingAgent.PriceLevel;
+
+                if (!restingAgent.IsActive)
+                {
+                    levelsConsumed++;
+                    RemoveIfInactive(restingAgent);
+                }
             }
+        }
+
+        return new DeterministicPrediction(
+            PredictedClose: SimulatedPrice,
+            ExhaustionPrice: SimulatedPrice,
+            RemainingAggressiveVolume: Math.Max(0m, remainingAggressiveVolume),
+            LevelsConsumed: levelsConsumed,
+            CancelledLevels: cancelledLevels);
+    }
+
+    private int PullTriggeredNeuroticLiquidity(Side aggressorSide, int triggerTicks)
+    {
+        var cancelled = 0;
+        var sideToCheck = aggressorSide == Side.Buy ? _asks : _bids;
+
+        foreach (var kvp in sideToCheck.ToArray())
+        {
+            var passive = kvp.Value;
+            if (passive.TryCancelByNeuroticTrigger(SimulatedPrice, _tickSize, triggerTicks))
+            {
+                sideToCheck.Remove(kvp.Key);
+                cancelled++;
+            }
+        }
+
+        return cancelled;
+    }
+
+    private bool TryGetBestPassiveLevel(Side aggressorSide, out TradingAgent passive)
+    {
+        var oppositeBook = aggressorSide == Side.Buy ? _asks : _bids;
+
+        foreach (var kvp in oppositeBook)
+        {
+            if (!kvp.Value.IsActive)
+            {
+                continue;
+            }
+
+            passive = kvp.Value;
+            return true;
+        }
+
+        passive = null!;
+        return false;
+    }
+
+    private void RemoveIfInactive(TradingAgent passive)
+    {
+        if (passive.IsActive)
+        {
+            return;
+        }
+
+        if (passive.Side == Side.Buy)
+        {
+            _bids.Remove(passive.PriceLevel);
         }
         else
         {
-            while (remaining > 0m && TryGetBestOrder(_bids, out var bestBidPrice, out var entry))
-            {
-                if (price > 0m && bestBidPrice < price)
-                {
-                    break;
-                }
-
-                var traded = Math.Min(remaining, entry.RemainingQuantity);
-                remaining -= traded;
-                entry.RemainingQuantity -= traded;
-                tradeCount++;
-                RegisterTrade(bestBidPrice, traded);
-            }
+            _asks.Remove(passive.PriceLevel);
         }
-
-        return tradeCount;
-    }
-
-    private void AddLimit(Order order)
-    {
-        var levels = order.Side == Side.Buy ? _bids : _asks;
-        if (!levels.TryGetValue(order.Price, out var queue))
-        {
-            queue = new Queue<LimitOrderEntry>();
-            levels[order.Price] = queue;
-        }
-
-        var entry = new LimitOrderEntry { Order = order, RemainingQuantity = order.Quantity };
-        queue.Enqueue(entry);
-
-        if (!_ordersByAgent.TryGetValue(order.AgentId, out var entries))
-        {
-            entries = [];
-            _ordersByAgent[order.AgentId] = entries;
-        }
-
-        entries.Add(entry);
-    }
-
-    private void RegisterTrade(decimal price, decimal quantity)
-    {
-        SimulatedPrice = price;
-        _recentTrades.Enqueue((price, quantity));
-
-        while (_recentTrades.Count > MaxTradeWindow)
-        {
-            _recentTrades.Dequeue();
-        }
-    }
-
-    private decimal CalculateTradeVwap()
-    {
-        if (_recentTrades.Count == 0)
-        {
-            return SimulatedPrice;
-        }
-
-        decimal notional = 0m;
-        decimal volume = 0m;
-        foreach (var (price, quantity) in _recentTrades)
-        {
-            notional += price * quantity;
-            volume += quantity;
-        }
-
-        return volume > 0m ? notional / volume : SimulatedPrice;
-    }
-
-    private static decimal GetTopQuantity(SortedDictionary<decimal, Queue<LimitOrderEntry>> levels)
-    {
-        foreach (var level in levels)
-        {
-            decimal qty = 0m;
-            foreach (var entry in level.Value)
-            {
-                if (!entry.IsCancelled && entry.RemainingQuantity > 0m)
-                {
-                    qty += entry.RemainingQuantity;
-                }
-            }
-
-            if (qty > 0m)
-            {
-                return qty;
-            }
-        }
-
-        return 0m;
-    }
-
-    private static decimal? GetBestPrice(SortedDictionary<decimal, Queue<LimitOrderEntry>> levels, Side side)
-    {
-        foreach (var level in levels)
-        {
-            while (level.Value.Count > 0 && (level.Value.Peek().IsCancelled || level.Value.Peek().RemainingQuantity <= 0m))
-            {
-                level.Value.Dequeue();
-            }
-
-            if (level.Value.Count > 0)
-            {
-                return level.Key;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool TryGetBestOrder(SortedDictionary<decimal, Queue<LimitOrderEntry>> levels, out decimal price, out LimitOrderEntry entry)
-    {
-        foreach (var level in levels)
-        {
-            while (level.Value.Count > 0 && (level.Value.Peek().IsCancelled || level.Value.Peek().RemainingQuantity <= 0m))
-            {
-                level.Value.Dequeue();
-            }
-
-            if (level.Value.Count > 0)
-            {
-                price = level.Key;
-                entry = level.Value.Peek();
-                return true;
-            }
-        }
-
-        price = 0m;
-        entry = null!;
-        return false;
     }
 }
